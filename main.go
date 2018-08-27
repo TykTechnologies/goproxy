@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -26,16 +27,8 @@ var (
 
 const none = "(none)"
 
-func main() {
-	parseFlags()
-	if len(flags.Args()) != 2 {
-		if debug {
-			log.Printf("Remaining arguments after parsing flags: %+v\n", flags.Args())
-		}
-		usage()
-		os.Exit(1)
-	}
-
+func processTCP(on, to string) {
+	fmt.Println("setting up TCP listener")
 	// ignore HUP and PIPE signals
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGHUP, syscall.SIGPIPE)
@@ -48,7 +41,6 @@ func main() {
 	resolver := make(chan string, 1)
 	manager := make(chan net.Conn, 10)
 
-	to := flags.Arg(1)
 	if verbose {
 		log.Printf("Will connect to `%s`\n", to)
 	}
@@ -61,41 +53,69 @@ func main() {
 		resolver <- to
 	}
 
-	on := flags.Arg(0)
 	if verbose {
 		proto := "tcp"
-		if udp {
-			proto = "udp"
-		}
 		log.Printf("Will listen on `%s://%s`\n", proto, on)
 	}
 
-	if udp {
-		laddr, err := net.ResolveUDPAddr("udp", on)
+	listener, err := net.Listen("tcp", on)
+	if err != nil {
+		log.Fatalf("Failed to setup TCP listener on `%s`: %v\n", on, err)
+	}
+	go manageTcp(resolver, manager)
+	for {
+		conn, err := listener.Accept()
 		if err != nil {
-			log.Fatalf("Error resolving `%s`: %v\n", on, err)
-		}
-		conn, err := net.ListenUDP("udp", laddr)
-		if err != nil {
-			log.Fatalf("Failed to setup UDP listener on `%s`: %v\n", on, err)
-		}
-		manager <- conn
-		manageUdp(resolver, manager)
-	} else {
-		listener, err := net.Listen("tcp", on)
-		if err != nil {
-			log.Fatalf("Failed to setup TCP listener on `%s`: %v\n", on, err)
-		}
-		go manageTcp(resolver, manager)
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				log.Printf("Failed to accept connection: %v\n", err)
-			} else {
-				manager <- conn
-			}
+			log.Printf("Failed to accept connection: %v\n", err)
+		} else {
+			manager <- conn
 		}
 	}
+}
+
+func main() {
+	parseFlags()
+	if len(flags.Args()) < 2 {
+		if debug {
+			log.Printf("Remaining arguments after parsing flags: %+v\n", flags.Args())
+		}
+		usage()
+		os.Exit(1)
+	}
+
+	for i := range flags.Args() {
+		route := strings.Split(flags.Arg(i), ":")
+		if len(route) != 3 {
+			log.Fatal("route must be in form inPort:targetHost:targetPort")
+		}
+
+		to := fmt.Sprintf("%s:%s", route[1], route[2])
+		on := fmt.Sprintf(":%s", route[0])
+		go processTCP(on, to)
+
+		if udp {
+			go handleUDP(on, []string{to})
+		}
+	}
+
+	// Wait to quit
+	fmt.Println("Press Ctrl+C to end")
+	waitForCtrlC()
+	fmt.Printf("\n")
+
+}
+
+func waitForCtrlC() {
+	var end_waiter sync.WaitGroup
+	end_waiter.Add(1)
+	var signal_channel chan os.Signal
+	signal_channel = make(chan os.Signal, 1)
+	signal.Notify(signal_channel, os.Interrupt)
+	go func() {
+		<-signal_channel
+		end_waiter.Done()
+	}()
+	end_waiter.Wait()
 }
 
 func usage() {
